@@ -38,19 +38,39 @@ def standalone_momentum_signal(candles):
     }
 
 
+# Stricter standalone reversal (tightens the existing rule; no new strategy).
+REV_RSI_OB = 75          # stricter than the momentum RSI_OB
+REV_RSI_OS = 25          # stricter than the momentum RSI_OS
+BB_PERIOD = 20
+BB_MULT = 2.0
+MIN_WICK_RATIO = 0.5     # rejection wick must be at least half the candle range
+
+
+def _bollinger(closes, period=BB_PERIOD, mult=BB_MULT):
+    window = closes[-period:]
+    mean = sum(window) / period
+    std = (sum((x - mean) ** 2 for x in window) / period) ** 0.5   # population std, as TradingView
+    return mean + mult * std, mean - mult * std
+
+
 def standalone_reversal_signal(candles):
     """Return a standalone 1m RSI reversal from the latest complete candle.
 
-    RSI is evaluated on the candle's actual high/low with the preceding
-    RSI_PERIOD closes held fixed. A directional candle body must close away
-    from the extreme; gaps, malformed OHLC, dojis, and ambiguous bars do not
-    produce a signal.
+    All must hold on the closed candle:
+      1. Intrabar RSI extreme (actual high/low with preceding closes fixed)
+         at or beyond REV_RSI_OB / REV_RSI_OS.
+      2. The candle pierced the Bollinger(20, 2) band on that side and
+         closed back inside it.
+      3. A directional body closing away from the extreme, with a rejection
+         wick of at least MIN_WICK_RATIO of the candle range.
+    Gaps, malformed OHLC, dojis, and ambiguous bars do not produce a signal.
     """
-    if len(candles) < RSI_PERIOD + 1:
+    need = max(RSI_PERIOD + 1, BB_PERIOD)
+    if len(candles) < need:
         return None
     rows = [
         {**c, "max": c.get("max", c.get("high")), "min": c.get("min", c.get("low"))}
-        for c in candles[-(RSI_PERIOD + 1):]
+        for c in candles[-need:]
     ]
     if any(
         not all(number(c.get(key)) for key in ("time", "open", "close", "max", "min"))
@@ -67,25 +87,39 @@ def standalone_reversal_signal(candles):
 
     row = rows[-1]
     closes = [c["close"] for c in rows]
-    overbought = calc_rsi([*closes[:-1], row["max"]], RSI_PERIOD)
-    oversold = calc_rsi([*closes[:-1], row["min"]], RSI_PERIOD)
+    rsi_closes = closes[-(RSI_PERIOD + 1):]
+    overbought = calc_rsi([*rsi_closes[:-1], row["max"]], RSI_PERIOD)
+    oversold = calc_rsi([*rsi_closes[:-1], row["min"]], RSI_PERIOD)
     if overbought is None or oversold is None:
         return None
 
-    put = overbought >= RSI_OB and row["close"] < row["open"] and row["close"] < row["max"]
-    call = oversold <= RSI_OS and row["close"] > row["open"] and row["close"] > row["min"]
+    upper, lower = _bollinger(closes)
+    rng = row["max"] - row["min"]
+    if rng <= 0:
+        return None
+    upper_wick = (row["max"] - max(row["open"], row["close"])) / rng
+    lower_wick = (min(row["open"], row["close"]) - row["min"]) / rng
+
+    put = (overbought >= REV_RSI_OB
+           and row["close"] < row["open"]
+           and row["max"] > upper and row["close"] < upper
+           and upper_wick >= MIN_WICK_RATIO)
+    call = (oversold <= REV_RSI_OS
+            and row["close"] > row["open"]
+            and row["min"] < lower and row["close"] > lower
+            and lower_wick >= MIN_WICK_RATIO)
     if put == call:
         return None
     if put:
         return {
             "side": "PUT", "signal_time": row["time"], "execution_candle": row["time"] + 60,
             "signal_open": row["open"], "signal_close": row["close"],
-            "rsi": calc_rsi(closes, RSI_PERIOD), "extreme_rsi": overbought,
+            "rsi": calc_rsi(rsi_closes, RSI_PERIOD), "extreme_rsi": overbought,
         }
     return {
         "side": "CALL", "signal_time": row["time"], "execution_candle": row["time"] + 60,
         "signal_open": row["open"], "signal_close": row["close"],
-        "rsi": calc_rsi(closes, RSI_PERIOD), "extreme_rsi": oversold,
+        "rsi": calc_rsi(rsi_closes, RSI_PERIOD), "extreme_rsi": oversold,
     }
 
 
@@ -105,15 +139,4 @@ def reversal_signal(candles, loss_time, lost_side):
     # an intrabar extreme without inventing ticks or using a future candle.
     if lost_side.upper() == "CALL":
         extreme = calc_rsi([*closes[:-1], row["max"]])
-        valid = row["close"] < row["max"]
-        side = "PUT"
-    elif lost_side.upper() == "PUT":
-        extreme = calc_rsi([*closes[:-1], row["min"]])
-        valid = row["close"] > row["min"]
-        side = "CALL"
-    else:
-        return None
-    if not valid:
-        return None
-    return {"side": side, "signal_time": loss_time, "execution_candle": loss_time + 60,
-            "signal_close": row["close"], "rsi_extreme": extreme, "rsi_signal": at_close}
+        valid = row["close"] 
