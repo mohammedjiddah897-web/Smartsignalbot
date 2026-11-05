@@ -1,0 +1,27 @@
+name: MojidSignalBot
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: mojid-signals
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - run: uv run --with requests python signal_bot.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          IQ_EMAIL: ${{ secrets.IQ_EMAIL }}
+          IQ_PASSWORD: ${{ secrets.IQ_PASSWORD }}
+          IQ_ACCOUNT_MODE: PRACTICE
+          MAX_RUNTIME_MIN: "345"
