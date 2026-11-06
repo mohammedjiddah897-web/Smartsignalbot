@@ -11,8 +11,13 @@ Drives PairEngine exactly the way runner.py does:
 There is no broker trade, so each signal is settled from its execution
 candle's close vs the price when the signal was sent, then fed back through
 broker_settled() so pole continuation and loss reversals work as in the bot.
+
+Expiry test (logging only): every signal is also checked at 1, 2, 3 and 5
+minutes from the same 1m candles. Results are kept per strategy in
+expiry_stats.json and shown in /status. Signals and timers are unchanged.
 """
 
+import json
 import os
 import sys
 import threading
@@ -39,6 +44,8 @@ FEED_STALL_SECONDS = 180
 PREALERT_SECOND = 50         # "get ready" ~10s before the next candle opens
 ACTIVE_COUNT = DEFAULT_COUNT
 WAT = timezone(timedelta(hours=1))
+EXPIRIES = (1, 2, 3, 5)      # minutes checked in the background expiry test
+STATS_FILE = os.environ.get("EXPIRY_STATS_FILE", "expiry_stats.json")
 
 TG = f"https://api.telegram.org/bot{TOKEN}"
 KEYBOARD = {"keyboard": [[{"text": "/status"}]], "resize_keyboard": True}
@@ -58,6 +65,98 @@ current_api = None
 stats = {"signals": 0, "win": 0, "loss": 0, "equal": 0}
 last_new_candle = time.time()
 started_at = time.time()
+shadows = []                 # signals still waiting for their 2/3/5 minute results
+
+
+# ---------------- Expiry test (logging only) ----------------
+
+def load_expiry_stats():
+    try:
+        with open(STATS_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+expiry_stats = load_expiry_stats()   # {kind: {"1": {"win","loss","equal"}, ...}}
+
+
+def save_expiry_stats():
+    try:
+        tmp = STATS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(expiry_stats, f)
+        os.replace(tmp, STATS_FILE)
+    except Exception as e:
+        print(f"[expiry stats save error] {e}")
+
+
+def track_expiries(pair, entry, price):
+    if not number(price) or not number(entry.get("execution_candle")):
+        return
+    shadows.append({"pair": pair, "kind": entry.get("kind") or "other", "side": entry["side"],
+                    "price": price, "slot": int(entry["execution_candle"]), "res": {}})
+
+
+def update_expiries(pair, candle):
+    """An N-minute expiry is decided by the close of the candle opening at slot + (N-1) minutes."""
+    if not number(candle.get("time")):
+        return
+    done = []
+    for s in shadows:
+        if s["pair"] != pair:
+            continue
+        for n in EXPIRIES:
+            key = str(n)
+            if key in s["res"]:
+                continue
+            target = s["slot"] + (n - 1) * 60
+            if candle["time"] == target and number(candle.get("close")):
+                close = candle["close"]
+                if close == s["price"]:
+                    s["res"][key] = "equal"
+                elif (close > s["price"]) == (s["side"] == "CALL"):
+                    s["res"][key] = "win"
+                else:
+                    s["res"][key] = "loss"
+            elif candle["time"] > target:
+                s["res"][key] = "missed"   # candle gap: never guess
+        if len(s["res"]) == len(EXPIRIES):
+            done.append(s)
+    for s in done:
+        shadows.remove(s)
+        per_kind = expiry_stats.setdefault(s["kind"], {})
+        for key, result in s["res"].items():
+            if result == "missed":
+                continue
+            bucket = per_kind.setdefault(key, {"win": 0, "loss": 0, "equal": 0})
+            bucket[result] += 1
+    if done:
+        save_expiry_stats()
+
+
+def expiry_text():
+    if not expiry_stats:
+        return "Expiry test: no completed signals yet"
+    lines = ["Expiry test (win rate, decided signals):"]
+    totals = {}
+    for kind in sorted(expiry_stats):
+        parts = []
+        for n in EXPIRIES:
+            b = expiry_stats[kind].get(str(n), {})
+            w, l = b.get("win", 0), b.get("loss", 0)
+            t = totals.setdefault(str(n), [0, 0])
+            t[0] += w
+            t[1] += l
+            parts.append(f"{n}m {w / (w + l) * 100:.0f}% ({w + l})" if w + l else f"{n}m –")
+        lines.append(f"• {KIND_LABEL.get(kind, kind)}: " + " | ".join(parts))
+    parts = []
+    for n in EXPIRIES:
+        w, l = totals.get(str(n), [0, 0])
+        parts.append(f"{n}m {w / (w + l) * 100:.0f}% ({w + l})" if w + l else f"{n}m –")
+    lines.append("• All: " + " | ".join(parts))
+    return "\n".join(lines)
 
 
 # ---------------- Telegram ----------------
@@ -122,6 +221,7 @@ def status_text():
             f"Signals: {stats['signals']} | W {stats['win']} / L {stats['loss']} / ="
             f" {stats['equal']} (from candle closes)",
             f"Open signal: {open_trade['pair'] + ' ' + open_trade['entry']['side'] if open_trade else 'none'}",
+            expiry_text(),
             "Pairs:",
         ]
         for p in active_pairs:
@@ -195,6 +295,7 @@ def sync_pairs(api):
         with lock:
             active_pairs.remove(p)
             release_open_trade(p)
+            shadows[:] = [s for s in shadows if s["pair"] != p]
         if p in engines:
             with engines[p].lock:
                 engines[p].discard_candidates()
@@ -320,6 +421,7 @@ def dispatch(pair, eng, entry, quote):
     with lock:
         open_trade = {"pair": pair, "token": token, "entry": entry, "entry_price": price}
         stats["signals"] += 1
+        track_expiries(pair, entry, price)
     eng.submitted(token, entry)
     quote_obs = entry.get("confirmation_quote")
     event = {
@@ -409,6 +511,7 @@ def poll_pair(api, pair):
                 if outside_side(candle, upper, lower) != pa["side"]:
                     cancel_prealert(pair, "candle closed back inside the band")
             settle_if_due(pair, eng, candle)
+            update_expiries(pair, candle)
             eng.step(candle)
     now = time.time()
     quote = iq_feed.forming_candle(api, pair, now)
@@ -458,6 +561,8 @@ def main():
     stop.set()
     for ev in list(workers.values()):
         ev.set()
+    with lock:
+        save_expiry_stats()
 
 
 if __name__ == "__main__":
