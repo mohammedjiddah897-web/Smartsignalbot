@@ -16,10 +16,12 @@ Expiry test (logging only): every signal is also checked at 1, 2, 3 and 5
 minutes from the same 1m candles. Results are kept per strategy in
 expiry_stats.json and shown in /status.
 
-FCB breakout signals use a 5-minute timer (FCB_EXPIRY_MIN). The engine is
-still settled at 1 minute exactly as before, so its internal logic is
-unchanged; the WIN/LOSS message and stats for FCB use the 5-minute close, and
-no new signal is sent until that 5-minute trade has expired.
+FCB breakout and pole continuation signals use longer timers (FCB_EXPIRY_MIN,
+POLE_EXPIRY_MIN, default 2 minutes); RSI reversal stays at 1 minute. The engine
+is still settled at 1 minute exactly as before, so its internal logic is
+unchanged; the WIN/LOSS message and stats use the longer close. While a longer
+trade is open, no new signal is sent except a pole continuation on that same
+pair (pole follows its FCB on the next candle).
 """
 
 import json
@@ -51,7 +53,9 @@ ACTIVE_COUNT = DEFAULT_COUNT
 WAT = timezone(timedelta(hours=1))
 EXPIRIES = (1, 2, 3, 5)      # minutes checked in the background expiry test
 STATS_FILE = os.environ.get("EXPIRY_STATS_FILE", "expiry_stats.json")
-FCB_EXPIRY_MIN = int(os.environ.get("FCB_EXPIRY_MIN", "5"))   # timer for FCB breakout signals
+FCB_EXPIRY_MIN = int(os.environ.get("FCB_EXPIRY_MIN", "2"))     # timer for FCB breakout signals
+POLE_EXPIRY_MIN = int(os.environ.get("POLE_EXPIRY_MIN", "2"))   # timer for pole continuation signals
+EXPIRY_BY_KIND = {"FCB": FCB_EXPIRY_MIN, "pole": POLE_EXPIRY_MIN}   # anything else: 1 minute
 
 TG = f"https://api.telegram.org/bot{TOKEN}"
 KEYBOARD = {"keyboard": [[{"text": "/status"}]], "resize_keyboard": True}
@@ -72,7 +76,7 @@ stats = {"signals": 0, "win": 0, "loss": 0, "equal": 0}
 last_new_candle = time.time()
 started_at = time.time()
 shadows = []                 # signals still waiting for their 2/3/5 minute results
-fcb_hold = None              # open FCB signal on its longer timer, blocks new signals until expiry
+holds = []                   # open signals on longer timers, waiting for their expiry candle
 
 
 # ---------------- Expiry test (logging only) ----------------
@@ -218,6 +222,15 @@ def wat(ts):
     return datetime.fromtimestamp(ts, tz=WAT).strftime("%H:%M")
 
 
+def open_signal_text():
+    items = []
+    if open_trade:
+        items.append(f"{open_trade['pair']} {open_trade['entry']['side']}")
+    items += [f"{h['pair']} {h['side']} ({KIND_LABEL.get(h['kind'], h['kind'])} {h['minutes']}m)"
+              for h in holds]
+    return ", ".join(items) if items else "none"
+
+
 def status_text():
     with lock:
         mins_up = int((time.time() - started_at) / 60)
@@ -227,7 +240,7 @@ def status_text():
             f"Last candle: {int(time.time() - last_new_candle)}s ago",
             f"Signals: {stats['signals']} | W {stats['win']} / L {stats['loss']} / ="
             f" {stats['equal']} (from candle closes)",
-            f"Open signal: {open_trade['pair'] + ' ' + open_trade['entry']['side'] if open_trade else (fcb_hold['pair'] + ' ' + fcb_hold['side'] + f' (FCB {FCB_EXPIRY_MIN}m)' if fcb_hold else 'none')}",
+            f"Open signal: {open_signal_text()}",
             expiry_text(),
             "Pairs:",
         ]
@@ -303,9 +316,7 @@ def sync_pairs(api):
             active_pairs.remove(p)
             release_open_trade(p)
             shadows[:] = [s for s in shadows if s["pair"] != p]
-            global fcb_hold
-            if fcb_hold and fcb_hold["pair"] == p:
-                fcb_hold = None
+            holds[:] = [h for h in holds if h["pair"] != p]
         if p in engines:
             with engines[p].lock:
                 engines[p].discard_candidates()
@@ -364,10 +375,11 @@ def settle_if_due(pair, eng, candle):
     eng.broker_settled(t["token"], result, time.time(), allow_entries=True,
                        loss_candle=loss_candle, win_expiry=win_expiry, settled_entry=entry)
     open_trade = None
-    if kind == "FCB" and FCB_EXPIRY_MIN > 1:
-        global fcb_hold
-        fcb_hold = {"pair": pair, "side": entry["side"], "price": price, "slot": int(slot)}
-        settle_hold_if_due(pair, candle)   # no-op unless the expiry candle is already here
+    minutes = EXPIRY_BY_KIND.get(kind, 1)
+    if minutes > 1:
+        holds.append({"pair": pair, "side": entry["side"], "price": price, "slot": int(slot),
+                      "kind": kind, "minutes": minutes})
+        settle_holds_if_due(pair, candle)   # no-op unless the expiry candle is already here
         return
     stats[result] += 1
     icon = {"win": "✅ WIN", "loss": "❌ LOSS", "equal": "➖ DRAW"}[result]
@@ -391,30 +403,40 @@ def with_timer(text, slot, minutes):
     return text + "\n" + expires
 
 
-def settle_hold_if_due(pair, candle):
-    """Decide an FCB signal at its longer expiry: close of the candle opening at slot + (N-1) min."""
-    global fcb_hold
-    h = fcb_hold
-    if not h or h["pair"] != pair or not number(candle.get("time")):
+def settle_holds_if_due(pair, candle):
+    """Decide longer-timer signals: close of the candle opening at slot + (N-1) minutes."""
+    if not number(candle.get("time")):
         return
-    target = h["slot"] + (FCB_EXPIRY_MIN - 1) * 60
-    if candle["time"] < target:
-        return
-    if candle["time"] == target and number(h["price"]) and number(candle.get("close")):
-        close = candle["close"]
-        if close == h["price"]:
-            result = "equal"
-        elif (close > h["price"]) == (h["side"] == "CALL"):
-            result = "win"
+    for h in list(holds):
+        if h["pair"] != pair:
+            continue
+        target = h["slot"] + (h["minutes"] - 1) * 60
+        if candle["time"] < target:
+            continue
+        if candle["time"] == target and number(h["price"]) and number(candle.get("close")):
+            close = candle["close"]
+            if close == h["price"]:
+                result = "equal"
+            elif (close > h["price"]) == (h["side"] == "CALL"):
+                result = "win"
+            else:
+                result = "loss"
         else:
-            result = "loss"
-    else:
-        result = "equal"  # missed the expiry candle: release, never guess
-    fcb_hold = None
-    stats[result] += 1
-    icon = {"win": "✅ WIN", "loss": "❌ LOSS", "equal": "➖ DRAW"}[result]
-    send(f"{icon}  {pair} {h['side']} (FCB breakout · {FCB_EXPIRY_MIN}m)\n"
-         f"Entry {h['price']} → close {candle.get('close')}")
+            result = "equal"  # missed the expiry candle: release, never guess
+        holds.remove(h)
+        stats[result] += 1
+        icon = {"win": "✅ WIN", "loss": "❌ LOSS", "equal": "➖ DRAW"}[result]
+        send(f"{icon}  {pair} {h['side']} ({KIND_LABEL.get(h['kind'], h['kind'])} · {h['minutes']}m)\n"
+             f"Entry {h['price']} → close {candle.get('close')}")
+
+
+def hold_blocks(pair, entry):
+    """Longer trades block new signals, except a pole continuation on the same pair."""
+    if not holds:
+        return False
+    if entry.get("kind") == "pole" and all(h["pair"] == pair for h in holds):
+        return False
+    return True
 
 
 # ---------------- Dispatch (mirrors runner.dispatch_entries, minus the buy) ----------------
@@ -471,7 +493,7 @@ def dispatch(pair, eng, entry, quote):
         return
     if entry["engine"] == "RSI" and not eng.rsi_entry_allowed(entry):
         return skip(eng, entry)
-    if open_trade is not None or fcb_hold is not None or eng.pending[entry["engine"]] is not None:
+    if open_trade is not None or hold_blocks(pair, entry) or eng.pending[entry["engine"]] is not None:
         return skip(eng, entry)  # runner: ONE_TRADE_AT_A_TIME / PAIR_ENGINE_OCCUPIED
     token = uuid.uuid4().hex
     price = quote.get("close") if quote else None
@@ -488,8 +510,9 @@ def dispatch(pair, eng, entry, quote):
         "quote": quote_obs.get("close") if isinstance(quote_obs, dict) else price,
     }
     text = TelegramAlerts.text(event)
-    if entry.get("kind") == "FCB" and FCB_EXPIRY_MIN > 1:
-        text = with_timer(text, slot, FCB_EXPIRY_MIN)
+    minutes = EXPIRY_BY_KIND.get(entry.get("kind"), 1)
+    if minutes > 1:
+        text = with_timer(text, slot, minutes)
     broadcast_signal(text, slot)
     pa = prealerts.get(pair)
     if pa and pa["a_time"] + 60 == slot:
@@ -571,7 +594,7 @@ def poll_pair(api, pair):
                 if outside_side(candle, upper, lower) != pa["side"]:
                     cancel_prealert(pair, "candle closed back inside the band")
             settle_if_due(pair, eng, candle)
-            settle_hold_if_due(pair, candle)
+            settle_holds_if_due(pair, candle)
             update_expiries(pair, candle)
             eng.step(candle)
     now = time.time()
@@ -603,8 +626,9 @@ def main():
     last_check, stall_alerted = time.time(), False
     while not stop.is_set():
         over = time.time() - started_at >= MAX_RUNTIME_MIN * 60
-        if over and ((open_trade is None and fcb_hold is None)
-                     or time.time() - started_at >= MAX_RUNTIME_MIN * 60 + 60 * FCB_EXPIRY_MIN + 90):
+        longest = max([1, *EXPIRY_BY_KIND.values()])
+        if over and ((open_trade is None and not holds)
+                     or time.time() - started_at >= MAX_RUNTIME_MIN * 60 + 60 * longest + 90):
             print("[runner] max runtime reached, exiting for handoff")
             break
         try:
