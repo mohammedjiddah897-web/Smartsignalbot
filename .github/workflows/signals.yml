@@ -14,7 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
-      - uses: actions/checkout@v4
+            - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - name: Queue the next run
