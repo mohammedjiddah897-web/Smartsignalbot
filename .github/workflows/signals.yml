@@ -28,7 +28,7 @@ jobs:
           SECRETS_JSON: ${{ toJSON(secrets) }}
           VARS_JSON: ${{ toJSON(vars) }}
         run: |
-          timeout 20700 uv run --with requests python -c "
+          timeout 21000 uv run --with requests python -c "
           import json, os, runpy
           for raw in (os.environ['VARS_JSON'], os.environ['SECRETS_JSON']):
               for k, v in json.loads(raw).items():
